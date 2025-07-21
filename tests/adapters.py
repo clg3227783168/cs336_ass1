@@ -9,7 +9,19 @@ import numpy.typing as npt
 import torch
 from torch import Tensor
 
+import numpy as np
+import regex as re
+import time
 
+##### Helper functions #####
+
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+def to_bytes_tuple(word: str) -> Tuple[bytes]:
+    l = list(word.encode("utf-8"))
+    l = [bytes([x]) for x in l]
+    return tuple(l)
+
+##### Helper functions #####
 
 def run_linear(
     d_in: int,
@@ -30,7 +42,8 @@ def run_linear(
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
 
-    raise NotImplementedError
+    return torch.matmul(in_features, weights.T)
+    
 
 
 def run_embedding(
@@ -52,7 +65,7 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    return weights[token_ids]
 
 
 def run_swiglu(
@@ -84,7 +97,10 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    cond = run_silu(torch.matmul(in_features, w1_weight.T))
+    x = torch.matmul(in_features, w3_weight.T)
+    
+    return torch.matmul(cond * x, w2_weight.T)
 
 
 def run_scaled_dot_product_attention(
@@ -105,7 +121,12 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    attn = torch.matmul(Q, K.transpose(-2, -1)) / torch.sqrt(torch.tensor(Q.shape[-1]))
+    if mask is not None:    
+        attn = attn.masked_fill(mask == 0, float("-inf"))
+    attn = torch.softmax(attn, dim=-1)
+
+    return torch.matmul(attn, V)
 
 
 def run_multihead_self_attention(
@@ -131,7 +152,7 @@ def run_multihead_self_attention(
         max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
         q_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the Q projection
         k_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the K projection
-        v_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the V projection
+        v_proj_weight (Float[Tensor, "d_v d_in"]): Weights for the V projection
         o_proj_weight (Float[Tensor, "d_model d_v"]): Weights for the output projection
         in_features (Float[Tensor, "... sequence_length d_in"]): Tensor to run your implementation on.
 
@@ -139,7 +160,34 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    d_k, d_in = q_proj_weight.shape
+    d_v = v_proj_weight.shape[0]
+
+    q = run_linear(d_in, d_k, q_proj_weight, in_features)
+    k = run_linear(d_in, d_k, k_proj_weight, in_features)
+    v = run_linear(d_in, d_v, v_proj_weight, in_features)   # B, T, d_v // nh
+
+    q = q.view(q.shape[:-1] + (num_heads, -1))   # B, T, nh, d_k // nh
+    k = k.view(k.shape[:-1] + (num_heads, -1))
+    v = v.view(v.shape[:-1] + (num_heads, -1))   # B, T, nh, d_v // nh
+
+    q = q.permute(0, 2, 1, 3)   # B, nh, T, d_k // nh
+    k = k.permute(0, 2, 1, 3)
+    v = v.permute(0, 2, 1, 3)   # B, nh, T, d_v // nh
+
+    # casual mask
+    seq_len = q.shape[2]
+    mask = torch.tril(torch.ones(seq_len, seq_len)).bool()
+    attn_out = run_scaled_dot_product_attention(q, k, v, mask) # B, nh, T, d_v // nh
+
+    attn_out = attn_out.permute(0, 2, 1, 3) # B, T, nh, d_v // nh
+    attn_out = attn_out.contiguous()
+    attn_out = attn_out.view(attn_out.shape[:-2] + (d_v,))    # B, T, d_v
+
+    out = run_linear(d_v, d_model, o_proj_weight, attn_out)
+
+    return out
+
 
 
 def run_multihead_self_attention_with_rope(
@@ -179,7 +227,38 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    d_k, d_in = q_proj_weight.shape
+    d_v = v_proj_weight.shape[0]
+    seq_len = in_features.shape[-2]
+
+    q = run_linear(d_in, d_k, q_proj_weight, in_features)
+    k = run_linear(d_in, d_k, k_proj_weight, in_features)
+    v = run_linear(d_in, d_v, v_proj_weight, in_features)   # B, T, d_v // nh
+
+    q = q.view(q.shape[:-1] + (num_heads, -1))   # B, T, nh, d_k // nh
+    k = k.view(k.shape[:-1] + (num_heads, -1))
+    v = v.view(v.shape[:-1] + (num_heads, -1))   # B, T, nh, d_v // nh
+
+    q = q.permute(0, 2, 1, 3)   # B, nh, T, d_k // nh
+    k = k.permute(0, 2, 1, 3)
+    v = v.permute(0, 2, 1, 3)   # B, nh, T, d_v // nh
+
+    # rope
+    if token_positions is not None:
+        q = run_rope(d_k // num_heads, theta, seq_len, q, token_positions)
+        k = run_rope(d_k // num_heads, theta, seq_len, k, token_positions)
+
+    # casual mask
+    mask = torch.tril(torch.ones(seq_len, seq_len)).bool()
+    attn_out = run_scaled_dot_product_attention(q, k, v, mask) # B, nh, T, d_v // nh
+
+    attn_out = attn_out.permute(0, 2, 1, 3) # B, T, nh, d_v // nh
+    attn_out = attn_out.contiguous()
+    attn_out = attn_out.view(attn_out.shape[:-2] + (d_v,))    # B, T, d_v
+
+    out = run_linear(d_v, d_model, o_proj_weight, attn_out)
+
+    return out
 
 
 def run_rope(
@@ -191,17 +270,53 @@ def run_rope(
 ) -> Float[Tensor, " ... sequence_length d_k"]:
     """
     Run RoPE for a given input tensor.
-
+    
     Args:
         d_k (int): Embedding dimension size for the query or key tensor.
         theta (float): RoPE parameter.
         max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
         in_query_or_key (Float[Tensor, "... sequence_length d_k"]): Input tensor to run RoPE on.
         token_positions (Int[Tensor, "... sequence_length"]): Tensor of shape (batch_size, sequence_length) with the token positions
+    
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    seq_len = in_query_or_key.shape[-2]
+    # 创建频率
+    freqs = 1.0 / (theta ** (torch.arange(0, d_k, 2).float() / d_k))    # (d_k // 2,)
+    
+    # 扩展 freqs 以匹配最大序列长度
+    freqs = freqs.unsqueeze(0).expand(max_seq_len, -1)  # (max_seq_len, d_k // 2)
+    
+    # 创建位置索引
+    t = torch.arange(max_seq_len).unsqueeze(1)          # (max_seq_len, 1)
+    
+    # 计算嵌入
+    emb = freqs * t                                     # (max_seq_len, d_k // 2)
+    
+    # 创建旋转矩阵
+    cos_emb = torch.cos(emb)                            # (max_seq_len, d_k // 2)
+    sin_emb = torch.sin(emb)                              # (max_seq_len, d_k // 2)
+
+    cos_emb, sin_emb = cos_emb[:seq_len], sin_emb[:seq_len]
+    
+    # 将 RoPE 应用于输入张量
+    # 拆分输入为偶数和奇数维度
+    x_even = in_query_or_key[..., ::2]                  # (..., seq_len, d_k // 2)
+    x_odd = in_query_or_key[..., 1::2]                  # (..., seq_len, d_k // 2)
+    
+    # 计算旋转后的表示
+    rotated_even = x_even * cos_emb - x_odd * sin_emb
+    rotated_odd = x_even * sin_emb + x_odd * cos_emb
+    
+    # 重新组合维度
+    result = torch.zeros_like(in_query_or_key)
+    result[..., ::2] = rotated_even
+    result[..., 1::2] = rotated_odd
+    
+    return result
+
+
 
 
 def run_transformer_block(
@@ -274,7 +389,49 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    # 获取 token 位置
+    batch_size, seq_length, _ = in_features.shape
+    token_positions = torch.arange(seq_length).expand(batch_size, -1)
+    # token_positions = torch.arange(seq_length)
+    
+    # 应用第一个 RMSNorm
+    ln1_weight = weights['ln1.weight']
+    normed_input = run_rmsnorm(d_model, 1e-5, ln1_weight, in_features)
+    
+    # 获取 Q、K、V 投影权重
+    q_proj_weight = weights['attn.q_proj.weight']
+    k_proj_weight = weights['attn.k_proj.weight']
+    v_proj_weight = weights['attn.v_proj.weight']
+    
+    # 运行多头自注意力（带 RoPE）
+    attn_output = run_multihead_self_attention_with_rope(
+        d_model, num_heads, seq_length, theta,
+        q_proj_weight, k_proj_weight, v_proj_weight,
+        weights['attn.output_proj.weight'],
+        normed_input,
+        token_positions
+    )
+    
+    # 第一个残差连接
+    residual = in_features + attn_output
+    
+    # 第二个 RMSNorm
+    ln2_weight = weights['ln2.weight']
+    normed_attn_output = run_rmsnorm(d_model, 1e-5, ln2_weight, residual)
+    
+    # 运行 FFN（SwiGLU）
+    ffn_output = run_swiglu(
+        d_model, d_ff,
+        weights['ffn.w1.weight'],
+        weights['ffn.w2.weight'],
+        weights['ffn.w3.weight'],
+        normed_attn_output
+    )
+    
+    # 第二个残差连接
+    output = residual + ffn_output
+    
+    return output
 
 
 def run_transformer_lm(
@@ -356,7 +513,39 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    batch_size, seq_length = in_indices.shape
+    
+    # 获取 token 嵌入
+    token_embeddings = run_embedding(vocab_size, d_model, weights['token_embeddings.weight'], in_indices)
+    
+    # 处理每个Transformer层
+    hidden_state = token_embeddings
+    for i in range(num_layers):
+        # 构建当前层的权重字典
+        layer_weights = {}
+        for k, v in weights.items():
+            if k.startswith(f'layers.{i}.'):
+                layer_weights[k] = v
+
+        # remove layers.{i} in front of key
+        layer_weights.update({
+            k[len(f'layers.{i}.'):]: v for k, v in layer_weights.items()
+        })
+        
+        # 应用当前Transformer层
+        hidden_state = run_transformer_block(
+            d_model, num_heads, d_ff, context_length, rope_theta,
+            layer_weights, hidden_state
+        )
+    
+    # 最终层归一化
+    ln_final_weight = weights['ln_final.weight']
+    hidden_state = run_rmsnorm(d_model, 1e-6, ln_final_weight, hidden_state)
+    
+    # 语言模型头部 - 将隐藏状态映射到词汇表大小
+    lm_logits = run_linear(vocab_size, d_model, weights['lm_head.weight'], hidden_state)
+    
+    return lm_logits
 
 
 def run_rmsnorm(
@@ -379,7 +568,13 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    # return in_features / torch.sqrt(torch.mean(in_features ** 2, dim=-1, keepdim=True) + eps)
+    x = in_features
+    square = in_features ** 2
+    mean = torch.mean(square, dim=-1, keepdim=True)
+    rms = torch.sqrt(mean + eps)
+    return x / rms * weights
+
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -393,7 +588,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return in_features * torch.sigmoid(in_features)
 
 
 def run_get_batch(
@@ -416,7 +611,23 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    # 从数据集中随机选择起始位置
+    starts = np.random.randint(
+        low=0,
+        high=len(dataset) - context_length,
+        size=(batch_size,)
+    )
+    
+    # 根据起始位置获取输入序列和对应的标签
+    inputs = np.stack([dataset[start:start+context_length] for start in starts])
+    labels = np.stack([dataset[start+1:start+context_length+1] for start in starts])
+    
+    # 将numpy数组转换为torch张量，并移动到指定设备
+    return (
+        torch.from_numpy(inputs).long().to(device),
+        torch.from_numpy(labels).long().to(device)
+    )
+
 
 
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
@@ -432,7 +643,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    return torch.softmax(in_features, dim)
 
 
 def run_cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]) -> Float[Tensor, ""]:
@@ -448,7 +659,17 @@ def run_cross_entropy(inputs: Float[Tensor, " batch_size vocab_size"], targets: 
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    # Log-softmax for numerical stability (log(softmax(inputs)))
+    log_softmax = inputs - inputs.logsumexp(dim=1, keepdim=True)
+    
+    # Gather the log probabilities of the target classes
+    # Equivalent to: log_softmax[range(N), targets]
+    target_log_probs = log_softmax.gather(1, targets.unsqueeze(1)).squeeze(1)
+    
+    # Negative mean of the target log probabilities
+    loss = -target_log_probs.mean()
+    
+    return loss
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -460,15 +681,86 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
-
+    # Filter parameters with gradients
+    parameters_with_grad = [p for p in parameters if p.grad is not None]
+    
+    if len(parameters_with_grad) == 0:
+        return
+    
+    # Calculate total L2 norm of all gradients
+    total_norm = torch.sqrt(sum(torch.sum(p.grad.pow(2)) for p in parameters_with_grad))
+    
+    # Calculate clipping coefficient
+    clip_coef = max_l2_norm / (total_norm + 1e-6)  # Add small value to avoid division by zero
+    
+    # If total norm exceeds max_norm, scale down all gradients
+    if clip_coef < 1.0:
+        for p in parameters_with_grad:
+            p.grad.mul_(clip_coef)
 
 def get_adamw_cls() -> type[torch.optim.Optimizer]:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    class AdamW(torch.optim.Optimizer):
+        def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2):
+            if not 0.0 <= lr:
+                raise ValueError(f"Invalid learning rate: {lr}")
+            if not 0.0 <= eps:
+                raise ValueError(f"Invalid epsilon value: {eps}")
+            if not 0.0 <= betas[0] < 1.0:
+                raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+            if not 0.0 <= betas[1] < 1.0:
+                raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+            
+            defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+            super(AdamW, self).__init__(params, defaults)
 
+        def step(self, closure=None):
+            loss = None
+            if closure is not None:
+                loss = closure()
+
+            for group in self.param_groups:
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    
+                    # Perform stepweight decay
+                    p.data.mul_(1 - group['lr'] * group['weight_decay'])
+
+                    # Get parameter-specific state
+                    state = self.state[p]
+
+                    # State initialization
+                    if len(state) == 0:
+                        state['step'] = 0
+                        state['exp_avg'] = torch.zeros_like(p.data)
+                        state['exp_avg_sq'] = torch.zeros_like(p.data)
+                    
+                    exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                    beta1, beta2 = group['betas']
+                    step_size = group['lr']
+                    eps = group['eps']
+
+                    # Update state
+                    state['step'] += 1
+                    grad = p.grad.data
+
+                    # Decay the first and second moment running average coefficient
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                    denom = exp_avg_sq.sqrt().add_(eps)
+                    bias_correction1 = 1 - beta1 ** state['step']
+                    bias_correction2 = 1 - beta2 ** state['step']
+                    step_size = step_size * (bias_correction2 ** 0.5) / bias_correction1
+
+                    p.data.addcdiv_(exp_avg, denom, value=-step_size)
+
+            return loss
+    
+    return AdamW
 
 def run_get_lr_cosine_schedule(
     it: int,
@@ -495,8 +787,20 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    if it < warmup_iters:
+        # Warm-up 阶段：线性增加学习率
+        lr = (it / warmup_iters) * max_learning_rate
+    elif it <= cosine_cycle_iters:
+        # Cosine Annealing 阶段：余弦函数衰减
+        t = it - warmup_iters
+        T = cosine_cycle_iters - warmup_iters
+        cos_value = np.cos(np.pi * t / T)
+        lr = min_learning_rate + 0.5 * (max_learning_rate - min_learning_rate) * (1 + cos_value)
+    else:
+        # Post-annealing 阶段：学习率保持最小值
+        lr = min_learning_rate
 
+    return lr
 
 def run_save_checkpoint(
     model: torch.nn.Module,
@@ -514,8 +818,17 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
-
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'iteration': iteration
+    }
+    
+    if isinstance(out, (str, os.PathLike)):
+        with open(out, 'wb') as f:
+            torch.save(checkpoint, f)
+    else:
+        torch.save(checkpoint, out)
 
 def run_load_checkpoint(
     src: str | os.PathLike | BinaryIO | IO[bytes],
@@ -535,8 +848,21 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    if isinstance(src, (str, os.PathLike)):
+        with open(src, 'rb') as f:
+            checkpoint = torch.load(f)
+    else:
+        checkpoint = torch.load(src)
 
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    return checkpoint['iteration']
+
+
+import os
+from collections import defaultdict, Counter
+from typing import Dict, List, Tuple, Union, Iterable, Optional
 
 def get_tokenizer(
     vocab: dict[int, bytes],
@@ -558,7 +884,189 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(vocab=vocab, merges=merges, special_tokens=special_tokens)
+
+
+
+class Tokenizer:
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ):
+        """
+        Construct a BPE tokenizer from a given vocabulary, list of merges, and (optionally) special tokens.
+        
+        Args:
+            vocab: A dictionary mapping token IDs to their byte representations.
+            merges: A list of tuples representing BPE merge operations.
+            special_tokens: Optional list of strings that should be treated as unbreakable tokens.
+        """
+        self.vocab = vocab
+        self.byte_to_token_id = {v: k for k, v in vocab.items()}
+        self.merges = merges
+
+        self.bpe_ranks = dict(zip(merges, range(len(merges))))
+            
+        # Handle special tokens
+        self.special_tokens = special_tokens or []
+        self.special_token_bytes = [token.encode("utf-8") for token in self.special_tokens]
+        
+        # Ensure special tokens are in the vocabulary
+        for token_bytes in self.special_token_bytes:
+            if token_bytes not in self.byte_to_token_id:
+                # Add to vocab if not already present
+                new_id = len(self.vocab)
+                self.vocab[new_id] = token_bytes
+                self.byte_to_token_id[token_bytes] = new_id
+
+    def encode(self, text: str) -> list[int]:
+        """
+        Encode an input text string into a sequence of token IDs.
+        
+        Args:
+            text: The input text to encode.
+            
+        Returns:
+            A list of integer token IDs representing the encoded text.
+        """
+        tokens = []
+
+        # Sort special tokens by length (longest first) to avoid partial matches
+        sorted_special_tokens = sorted(self.special_tokens, key=len, reverse=True)
+        pattern = "|".join(map(re.escape, sorted_special_tokens))
+        if pattern:
+            parts = re.split(f"({pattern})", text)
+        else:
+            parts = [text]
+
+        for part in parts:
+            if part in self.special_tokens:
+                # If it's a special token, add its ID directly
+                tokens.append(self.byte_to_token_id[part.encode("utf-8")])
+            else:
+                # Otherwise, tokenize normally using BPE
+                tokens.extend(self._tokenize_normal(part))
+
+        return tokens
+
+    def encode_iterable(self, iterable: Iterable[str]) -> iter:
+        """
+        Given an iterable of strings (e.g., a file handle), yield token IDs lazily.
+        
+        Args:
+            iterable: An iterable source of text chunks.
+            
+        Yields:
+            Token IDs generated by processing the input iterable.
+        """
+        for chunk in iterable:
+            yield from self.encode(chunk)
+
+
+    def decode(self, ids: list[int]) -> str:
+        """
+        Decode a sequence of token IDs back into a human-readable string.
+        
+        Args:
+            ids: A list of integer token IDs.
+            
+        Returns:
+            The decoded string representation of the input token IDs.
+        """
+        # Concatenate all token bytes
+        full_bytes = b"".join(self.vocab[token_id] for token_id in ids)
+        
+        # Decode bytes to string, replacing invalid sequences
+        return full_bytes.decode("utf-8", errors="replace")
+
+    def _tokenize_normal(self, text: str) -> list[int]:
+        """
+        Tokenize a normal piece of text (not a special token) into token IDs.
+        
+        Args:
+            text: A string to tokenize.
+            
+        Returns:
+            A list of token IDs representing the tokenized text.
+        """
+        # Pre-tokenization
+        pre_tokens = []
+        for m in re.finditer(PAT, text):
+            word = m.group(0)
+            pre_tokens.append(word)
+
+        token_ids = []
+        for token in pre_tokens:
+            # Convert token to bytes tuple
+            byte_tuple = to_bytes_tuple(token)
+            
+            # Apply BPE merges
+            merged = self._apply_merges(byte_tuple)
+            
+            # Get token IDs
+            token_ids.extend(self.byte_to_token_id[b] for b in merged)
+        
+        return token_ids
+
+    def _apply_merges(self, byte_tuple: tuple[bytes, ...]) -> list[bytes]:
+        """
+        Apply BPE merges to a sequence of bytes.
+        
+        Args:
+            byte_tuple: A tuple of single-byte tokens.
+            
+        Returns:
+            A list of merged byte tokens after applying all applicable merges.
+        """
+        word: list[bytes] = list(byte_tuple)
+
+        def get_pairs(word: list[bytes]):
+            pairs = set()
+            prev_char = word[0]
+            for char in word[1:]:
+                pairs.add((prev_char, char))
+                prev_char = char
+            return pairs
+        
+        pairs = get_pairs(word)
+
+        if not pairs:
+            return word
+
+        while True:
+            bigram = min(pairs, key=lambda pair: self.bpe_ranks.get(pair, float('inf')))
+            if bigram not in self.bpe_ranks:
+                break
+            
+            first, second = bigram
+            new_word = []
+            i = 0
+            while i < len(word):
+                try:
+                    j = word.index(first, i)
+                except ValueError:
+                    new_word.extend(word[i:])
+                    break
+                else:
+                    new_word.extend(word[i:j])
+                    i = j
+
+                if word[i] == first and i < len(word) - 1 and word[i + 1] == second:
+                    new_word.append(first + second)
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            new_word = tuple(new_word)
+            word = new_word
+            if len(word) == 1:
+                break
+            else:
+                pairs = get_pairs(word)
+
+        return word
 
 
 def run_train_bpe(
@@ -588,4 +1096,88 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+
+    # Step 1: Initialize Vocabulary
+    vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+    next_id = 256
+
+    special_token_bytes = [token.encode("utf-8") for token in special_tokens]
+    for token_bytes in special_token_bytes:
+        if token_bytes not in vocab.values():
+            vocab[next_id] = token_bytes
+            next_id += 1
+
+    # Step 2: Pre-tokenization
+    pre_tokens_cnt = defaultdict(int)
+
+    def to_bytes_tuple(word: str) -> Tuple[bytes]:
+        l = list(tuple(word.encode("utf-8")))
+        l = [bytes([x]) for x in l]
+        return tuple(l)
+
+    with open(input_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    
+    chunks = re.split("|".join(map(re.escape, special_tokens)), text)
+    
+    for chunk in chunks:
+        for m in re.finditer(PAT, chunk):
+            word = m.group(0)
+            pre_tokens_cnt[to_bytes_tuple(word)] += 1   # key of pre_tokens_cnt e.g. (b'H', b'e', b'l', b'l', b'o')
+
+    # Step 3: Compute BPE Merges
+    merges = []
+
+    while len(vocab) < vocab_size:
+        pair_counts = defaultdict(int)
+
+        # Count all adjacent byte pairs
+        for token, cnt in pre_tokens_cnt.items():
+            for i in range(len(token) - 1):
+                pair = (token[i], token[i + 1])
+                pair_counts[pair] += cnt
+
+        if not pair_counts:
+            break  # No more pairs to merge
+
+        # Find the most frequent pair(s)
+        max_count = max(pair_counts.values())
+        candidates = [k for k, v in pair_counts.items() if v == max_count]
+        best_pair = max(candidates)
+
+        a, b = best_pair
+
+        # Create new token
+        new_token = a + b
+        vocab[next_id] = new_token
+        next_id += 1
+
+        # Apply the merge to all pre-tokenized sequences
+        # 收集变更
+        changes = []
+        for token, cnt in pre_tokens_cnt.items():
+            # Find all occurrences of the `best_pair` in `token`
+            indices = [i for i in range(len(token) - 1) if token[i:i + 2] == best_pair]
+            if indices:
+                # Replace each occurrence with `new_token`
+                new_pre_token = []
+                i = 0
+                while i < len(token):
+                    if i in indices:
+                        new_pre_token.append(new_token)
+                        i += 2
+                    else:
+                        new_pre_token.append(token[i])
+                        i += 1
+                new_pre_token = tuple(new_pre_token)
+                changes.append((token, new_pre_token, cnt))
+
+        # 应用变更
+        for old_token, new_pre_token, cnt in changes:
+            pre_tokens_cnt[new_pre_token] = pre_tokens_cnt.get(new_pre_token, 0) + cnt
+            del pre_tokens_cnt[old_token]
+
+        # Record the merge
+        merges.append((a, b))
+
+    return vocab, merges

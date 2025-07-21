@@ -1,0 +1,30 @@
+# hydra:
+#   run:
+#     dir: ./my_output_dir
+
+root_dir: ${hydra:runtime.cwd}
+
+eval:
+  save_path: checkpoints/cs336_lm_TinyStories/
+  iteration: 5000
+  prompt: A son is born from who
+  max_new_tokens: 64
+  temperature: 1.0
+  top_k: 50
+
+model_type: cs336_lm
+model:
+  vocab_size: 32000
+  context_length: 256
+  d_model: 512
+  num_layers: 4
+  num_heads: 16
+  d_ff: 1344
+  rope_theta: 10000.0
+
+dataset_name: TinyStories     
+dataset_split: valid
+tokenizer:
+  vocab_path: ${root_dir}/tokenizer_data/vocab.pkl
+  merges_path: ${root_dir}/tokenizer_data/merges.pkl
+  special_tokens: ["<|endoftext|>"]

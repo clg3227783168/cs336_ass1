@@ -1,0 +1,37 @@
+# hydra:
+#   run:
+#     dir: ./my_output_dir  # save outputs to custom dir
+
+root_dir: ${hydra:runtime.cwd}
+
+exp_name: cs336_lm_TinyStories
+dataset_name: TinyStories     # `TinyStories` or `owt`, change as needed
+dat_dir: ${root_dir}/data
+
+training:
+  train_data_path: ${dat_dir}/TinyStoriesV2-GPT4-train.dat
+  val_data_path: ${dat_dir}/TinyStoriesV2-GPT4-valid.dat
+
+  save_path: "checkpoints/${exp_name}" # save path for both first train and resume train
+  lr: 0.0005
+  min_lr: 0.0001
+  weight_decay: 0.01
+  batch_size: 32
+  context_length: 256
+  train_steps: 5000
+  clip_grad_norm: 1.0
+  warmup_iters: 500
+  cosine_iters: 5000
+  val_interval: 100
+  val_batches: 20
+  save_interval: 1000
+  resume_checkpoint: null   # load checkpoint from current hydra run dir
+
+model:
+  vocab_size: 32000
+  context_length: 256
+  d_model: 512
+  num_layers: 4
+  num_heads: 16
+  d_ff: 1344
+  rope_theta: 10000.0
