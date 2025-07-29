@@ -15,14 +15,15 @@ import time
 
 import sys
 from pathlib import Path
-# 获取当前文件的父目录的父目录 (即/workspace)
-base_dir = Path(__file__).resolve().parent.parent
+# # 获取当前文件的父目录的父目录 (即/workspace)
+# base_dir = Path(__file__).resolve().parent.parent
 
-# 添加basics目录到Python路径
-sys.path.append(str(base_dir))
+# # 添加basics目录到Python路径
+# sys.path.append(str(base_dir))
 
-# 从tokenizer模块导入类
-from basics import trainer_tokenizer
+# # 从tokenizer模块导入类
+# from basics import trainer_tokenizer
+from ..basics import trainer_tokenizer
 
 ##### Helper functions #####
 

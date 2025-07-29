@@ -52,6 +52,10 @@
 - 训练集：`TinyStoriesV2-GPT4-train.dat`
 - 验证集：`TinyStoriesV2-GPT4-valid.dat`
 
+原始数据集下载链接：
+- 训练集: [TinyStoriesV2-GPT4-train.txt](https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt)
+- 验证集: [TinyStoriesV2-GPT4-valid.txt](https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt)
+
 ## 环境设置与运行
 
 ### 依赖管理
