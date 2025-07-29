@@ -13,6 +13,17 @@ import numpy as np
 import regex as re
 import time
 
+import sys
+from pathlib import Path
+# 获取当前文件的父目录的父目录 (即/workspace)
+base_dir = Path(__file__).resolve().parent.parent
+
+# 添加basics目录到Python路径
+sys.path.append(str(base_dir))
+
+# 从tokenizer模块导入类
+from basics import trainer_tokenizer
+
 ##### Helper functions #####
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -1098,86 +1109,87 @@ def run_train_bpe(
     """
 
     # Step 1: Initialize Vocabulary
-    vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-    next_id = 256
+    # vocab: Dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+    # next_id = 256
 
-    special_token_bytes = [token.encode("utf-8") for token in special_tokens]
-    for token_bytes in special_token_bytes:
-        if token_bytes not in vocab.values():
-            vocab[next_id] = token_bytes
-            next_id += 1
+    # special_token_bytes = [token.encode("utf-8") for token in special_tokens]
+    # for token_bytes in special_token_bytes:
+    #     if token_bytes not in vocab.values():
+    #         vocab[next_id] = token_bytes
+    #         next_id += 1
 
-    # Step 2: Pre-tokenization
-    pre_tokens_cnt = defaultdict(int)
+    # # Step 2: Pre-tokenization
+    # pre_tokens_cnt = defaultdict(int)
 
-    def to_bytes_tuple(word: str) -> Tuple[bytes]:
-        l = list(tuple(word.encode("utf-8")))
-        l = [bytes([x]) for x in l]
-        return tuple(l)
+    # def to_bytes_tuple(word: str) -> Tuple[bytes]:
+    #     l = list(tuple(word.encode("utf-8")))
+    #     l = [bytes([x]) for x in l]
+    #     return tuple(l)
 
-    with open(input_path, "r", encoding="utf-8") as f:
-        text = f.read()
+    # with open(input_path, "r", encoding="utf-8") as f:
+    #     text = f.read()
     
-    chunks = re.split("|".join(map(re.escape, special_tokens)), text)
+    # chunks = re.split("|".join(map(re.escape, special_tokens)), text)
     
-    for chunk in chunks:
-        for m in re.finditer(PAT, chunk):
-            word = m.group(0)
-            pre_tokens_cnt[to_bytes_tuple(word)] += 1   # key of pre_tokens_cnt e.g. (b'H', b'e', b'l', b'l', b'o')
+    # for chunk in chunks:
+    #     for m in re.finditer(PAT, chunk):
+    #         word = m.group(0)
+    #         pre_tokens_cnt[to_bytes_tuple(word)] += 1   # key of pre_tokens_cnt e.g. (b'H', b'e', b'l', b'l', b'o')
 
-    # Step 3: Compute BPE Merges
-    merges = []
+    # # Step 3: Compute BPE Merges
+    # merges = []
 
-    while len(vocab) < vocab_size:
-        pair_counts = defaultdict(int)
+    # while len(vocab) < vocab_size:
+    #     pair_counts = defaultdict(int)
 
-        # Count all adjacent byte pairs
-        for token, cnt in pre_tokens_cnt.items():
-            for i in range(len(token) - 1):
-                pair = (token[i], token[i + 1])
-                pair_counts[pair] += cnt
+    #     # Count all adjacent byte pairs
+    #     for token, cnt in pre_tokens_cnt.items():
+    #         for i in range(len(token) - 1):
+    #             pair = (token[i], token[i + 1])
+    #             pair_counts[pair] += cnt
 
-        if not pair_counts:
-            break  # No more pairs to merge
+    #     if not pair_counts:
+    #         break  # No more pairs to merge
 
-        # Find the most frequent pair(s)
-        max_count = max(pair_counts.values())
-        candidates = [k for k, v in pair_counts.items() if v == max_count]
-        best_pair = max(candidates)
+    #     # Find the most frequent pair(s)
+    #     max_count = max(pair_counts.values())
+    #     candidates = [k for k, v in pair_counts.items() if v == max_count]
+    #     best_pair = max(candidates)
 
-        a, b = best_pair
+    #     a, b = best_pair
 
-        # Create new token
-        new_token = a + b
-        vocab[next_id] = new_token
-        next_id += 1
+    #     # Create new token
+    #     new_token = a + b
+    #     vocab[next_id] = new_token
+    #     next_id += 1
 
-        # Apply the merge to all pre-tokenized sequences
-        # 收集变更
-        changes = []
-        for token, cnt in pre_tokens_cnt.items():
-            # Find all occurrences of the `best_pair` in `token`
-            indices = [i for i in range(len(token) - 1) if token[i:i + 2] == best_pair]
-            if indices:
-                # Replace each occurrence with `new_token`
-                new_pre_token = []
-                i = 0
-                while i < len(token):
-                    if i in indices:
-                        new_pre_token.append(new_token)
-                        i += 2
-                    else:
-                        new_pre_token.append(token[i])
-                        i += 1
-                new_pre_token = tuple(new_pre_token)
-                changes.append((token, new_pre_token, cnt))
+    #     # Apply the merge to all pre-tokenized sequences
+    #     # 收集变更
+    #     changes = []
+    #     for token, cnt in pre_tokens_cnt.items():
+    #         # Find all occurrences of the `best_pair` in `token`
+    #         indices = [i for i in range(len(token) - 1) if token[i:i + 2] == best_pair]
+    #         if indices:
+    #             # Replace each occurrence with `new_token`
+    #             new_pre_token = []
+    #             i = 0
+    #             while i < len(token):
+    #                 if i in indices:
+    #                     new_pre_token.append(new_token)
+    #                     i += 2
+    #                 else:
+    #                     new_pre_token.append(token[i])
+    #                     i += 1
+    #             new_pre_token = tuple(new_pre_token)
+    #             changes.append((token, new_pre_token, cnt))
 
-        # 应用变更
-        for old_token, new_pre_token, cnt in changes:
-            pre_tokens_cnt[new_pre_token] = pre_tokens_cnt.get(new_pre_token, 0) + cnt
-            del pre_tokens_cnt[old_token]
+    #     # 应用变更
+    #     for old_token, new_pre_token, cnt in changes:
+    #         pre_tokens_cnt[new_pre_token] = pre_tokens_cnt.get(new_pre_token, 0) + cnt
+    #         del pre_tokens_cnt[old_token]
 
-        # Record the merge
-        merges.append((a, b))
+    #     # Record the merge
+    #     merges.append((a, b))
 
-    return vocab, merges
+    # return vocab, merges
+    return trainer_tokenizer.run_train_bpe(input_path, vocab_size, special_tokens)

@@ -116,10 +116,3 @@ generated_text = model.generate(
 )
 print(tokenizer.decode(generated_text))
 ```
-
-## 未来改进
-
-- 实现更多的注意力机制变体
-- 添加更多的训练优化技术
-- 支持更大规模的模型训练
-- 实现模型量化和推理优化
