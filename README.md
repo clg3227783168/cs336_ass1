@@ -1,5 +1,7 @@
 # CS336 作业1 - 从零开始实现Transformer语言模型
 
+[English Version](README_en.md)
+
 本项目参照CS336 作业1要求，从零开始实现了一个基于Transformer架构的语言模型。项目包含完整的模型架构、分词器、训练和评估流程，使用TinyStories数据集进行训练。
 
 ## 项目概述
